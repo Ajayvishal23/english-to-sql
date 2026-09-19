@@ -1,0 +1,16 @@
+# English -> SQL dependencies (pip install -r requirements.txt)
+# App
+streamlit>=1.36,<2.0
+SQLAlchemy>=2.0,<3.0
+pandas>=2.2
+
+# Local LLM: LangChain + Hugging Face (runs on your CPU/GPU, no API keys)
+langchain-core>=0.3
+langchain-huggingface>=0.1
+transformers>=4.45
+huggingface_hub>=0.24
+torch>=2.2
+accelerate>=0.33
+
+# Development / testing
+pytest>=8.0

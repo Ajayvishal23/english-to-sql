@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Local data / models (created on first run)
+models/
+data/uploads/
+data/sample.db
+logs/
+
+# Run logs
+setup_log.txt
+install_log.txt
+app_log.txt
+model_check.txt
+
+# Owner-only helper
+publish_to_github.bat
+publish_log.txt

@@ -1,0 +1,23 @@
+[theme]
+base = "light"
+primaryColor = "#4F46E5"
+font = "sans serif"
+
+[server]
+headless = true
+maxUploadSize = 200
+port = 8501
+# Watching source files makes Streamlit import every module inside
+# transformers (slow, noisy torchvision errors). Restart the app after
+# editing code instead.
+fileWatcherType = "none"
+runOnSave = false
+
+[runner]
+magicEnabled = false
+
+[browser]
+gatherUsageStats = false
+
+[logger]
+level = "warning"
