@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import streamlit as st
 from langchain_core.runnables import RunnableLambda
 
@@ -122,6 +123,7 @@ class Dashboard:
             "max_rows": self.settings.max_rows,
             "max_retries": self.settings.max_retries,
             "sample_rows": self.settings.sample_rows_in_prompt,
+            "max_tables": self.settings.max_tables_in_prompt,
             "auto_explain": False,
             "auto_run": False,
         }
@@ -198,9 +200,12 @@ class Dashboard:
         return (f"Downloading {self.model_id} "
                 "(first use only, this can take several minutes)…")
 
-    def _schema_context(self) -> str:
+    def _schema_context(self, question: str = "") -> str:
+        """Schema text for the model — only the tables this question needs."""
         assert self.schema is not None
-        return self.schema.to_prompt_context(int(st.session_state.sample_rows))
+        return self.schema.to_prompt_context(
+            int(st.session_state.sample_rows), question=question,
+            max_tables=int(st.session_state.max_tables))
 
     # ------------------------------------------------------------------ #
     # Sidebar
@@ -356,6 +361,10 @@ class Dashboard:
                    min_value=10, max_value=100_000, step=100)
         self._bind(st.number_input, "Auto-fix retries", "max_retries",
                    min_value=0, max_value=5)
+        self._bind(st.number_input, "Tables shown to the model", "max_tables",
+                   min_value=3, max_value=60,
+                   help="For big databases only the tables that match your "
+                        "question (plus the tables they link to) are sent.")
         self._bind(st.number_input, "Sample rows in prompt", "sample_rows",
                    min_value=0, max_value=10,
                    help="Example rows help the model learn value formats.")
@@ -498,12 +507,15 @@ class Dashboard:
             st.warning("Type a question first, or pick an example above.")
             return
         with st.spinner(self._model_spinner("Thinking…")):
-            result = self._pipeline().generate(question, self._schema_context())
+            result = self._pipeline().generate(
+                question, self._schema_context(question))
         if result.error:
             st.error(result.error)
             return
         st.session_state.sql_editor = result.sql
         st.session_state.last_question = result.question
+        for note in result.notes:
+            st.caption("🔧 " + note)
         st.session_state.result = None
         st.session_state.explanation = ""
         if st.session_state.auto_run:
@@ -517,7 +529,8 @@ class Dashboard:
         question = s.last_question or s.question_input or "(manual query)"
         pipeline = self._pipeline()
         with st.spinner("Running query…"):
-            result = pipeline.run(question, s.sql_editor, self._schema_context(),
+            result = pipeline.run(question, s.sql_editor,
+                                  self._schema_context(question),
                                   max_retries=int(s.max_retries))
         s.result = result
         s.explanation = ""
@@ -556,6 +569,8 @@ class Dashboard:
                 st.info(s.explanation, icon="💡")
             return
 
+        for note in result.notes:
+            st.caption("🔧 " + note)
         ex = result.execution
         step(3, "Results")
         if len(result.attempts) > 1:
@@ -586,42 +601,100 @@ class Dashboard:
             return
 
         chart = suggest_chart(ex.data)
-        names = ["📋 Table"] + (["📊 Chart"] if chart else []) + ["💡 Explanation",
-                                                                   "🧾 SQL"]
+        names = ["📋 Table", "📊 Chart", "💡 Explanation", "🧾 SQL"]
         tabs = dict(zip(names, st.tabs(names)))
         with tabs["📋 Table"]:
-            st.dataframe(ex.data, **fill(st.dataframe), hide_index=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            d1, d2, _ = st.columns([1, 1, 4])
-            d1.download_button(
-                "⬇ CSV", ex.data.to_csv(index=False).encode("utf-8"),
-                file_name=f"results_{stamp}.csv", mime="text/csv",
-                **fill(st.download_button),
-            )
-            d2.download_button(
-                "⬇ JSON", ex.data.to_json(orient="records", indent=2,
-                                         date_format="iso").encode("utf-8"),
-                file_name=f"results_{stamp}.json", mime="application/json",
-                **fill(st.download_button),
-            )
-        if chart:
-            with tabs["📊 Chart"]:
-                data = ex.data.set_index(chart.x)[chart.y]
-                if chart.kind == "line":
-                    st.line_chart(data)
-                else:
-                    st.bar_chart(data)
-                st.caption(f"{', '.join(chart.y)} by {chart.x}")
+            self._render_table(ex.data)
+        with tabs["📊 Chart"]:
+            self._render_chart(ex.data, chart)
         with tabs["💡 Explanation"]:
             if s.explanation:
                 st.markdown(s.explanation)
             else:
-                st.caption("Click **💡 Explain** above to get a plain-English "
-                           "explanation of this query.")
+                st.caption("Click **💡 Explain** above for a plain-English "
+                           "description of this query.")
+                if st.button("💡 Explain this query", key="explain_tab"):
+                    self._on_explain()
+                    st.rerun()
         with tabs["🧾 SQL"]:
             st.code(result.sql, language="sql")
-            if result.question:
-                st.caption(f"Question: {result.question}")
+            st.caption(f"Question: {result.question}")
+
+    @staticmethod
+    def _insight(df: pd.DataFrame) -> str:
+        """One useful sentence about the result (highest value, range, …)."""
+        numeric = [c for c in df.select_dtypes("number").columns
+                   if not c.lower().endswith("id")]
+        labels = [c for c in df.columns if c not in df.select_dtypes("number")]
+        if len(df) == 1 and len(df.columns) == 1:
+            return f"The answer is **{df.iat[0, 0]}**."
+        if numeric and labels and len(df) > 1:
+            col, label = numeric[0], labels[0]
+            row = df.loc[df[col].idxmax()]
+            share = ""
+            total = df[col].sum()
+            if total:
+                share = f" ({100 * row[col] / total:.0f}% of the total)"
+            return (f"Highest **{col}**: **{row[label]}** with "
+                    f"**{row[col]:,.2f}**{share}.")
+        if numeric:
+            col = numeric[0]
+            return (f"**{col}** ranges from {df[col].min():,.2f} to "
+                    f"{df[col].max():,.2f}, average {df[col].mean():,.2f}.")
+        return f"{len(df):,} rows returned."
+
+    def _render_table(self, df: pd.DataFrame) -> None:
+        st.info(self._insight(df), icon="✨")
+        c1, c2 = st.columns([3, 2])
+        needle = c1.text_input("Filter rows", placeholder="Filter rows…",
+                               label_visibility="collapsed", key="row_filter")
+        shown = df
+        if needle:
+            mask = df.astype(str).apply(
+                lambda col: col.str.contains(needle, case=False, na=False))
+            shown = df[mask.any(axis=1)]
+            c2.caption(f"{len(shown):,} of {len(df):,} rows match")
+        st.dataframe(shown, **fill(st.dataframe), hide_index=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        d1, d2, _ = st.columns([1, 1, 4])
+        d1.download_button(
+            "⬇ CSV", shown.to_csv(index=False).encode("utf-8"),
+            file_name=f"results_{stamp}.csv", mime="text/csv",
+            **fill(st.download_button))
+        d2.download_button(
+            "⬇ JSON", shown.to_json(orient="records", indent=2,
+                                    date_format="iso").encode("utf-8"),
+            file_name=f"results_{stamp}.json", mime="application/json",
+            **fill(st.download_button))
+
+    def _render_chart(self, df: pd.DataFrame, chart: Any) -> None:
+        numeric = [c for c in df.select_dtypes("number").columns]
+        if not numeric:
+            st.caption("This result has no numbers to plot.")
+            return
+        kinds = ["Bar", "Line", "Area", "Scatter"]
+        default_kind = {"line": 1}.get(getattr(chart, "kind", "bar"), 0)
+        c1, c2, c3 = st.columns(3)
+        kind = c1.selectbox("Chart", kinds, index=default_kind)
+        x_options = list(df.columns)
+        x_default = (x_options.index(chart.x)
+                     if chart and chart.x in x_options else 0)
+        x = c2.selectbox("Labels (x)", x_options, index=x_default)
+        y_default = chart.y if chart else numeric[:1]
+        y = c3.multiselect("Values (y)", numeric,
+                           default=[c for c in y_default if c in numeric])
+        if not y:
+            st.caption("Pick at least one value column.")
+            return
+        data = df[[x] + y].set_index(x)
+        if kind == "Line":
+            st.line_chart(data)
+        elif kind == "Area":
+            st.area_chart(data)
+        elif kind == "Scatter":
+            st.scatter_chart(df, x=x, y=y[0])
+        else:
+            st.bar_chart(data)
 
     def render_explorer_tab(self) -> None:
         if self.schema is None:
@@ -631,6 +704,13 @@ class Dashboard:
         if not tables:
             st.warning("This database has no tables.")
             return
+
+        sizes = pd.DataFrame(
+            [{"table": t.name, "rows": t.row_count or 0} for t in tables.values()]
+        ).set_index("table")
+        if sizes["rows"].sum():
+            with st.expander("📈 Table sizes", expanded=False):
+                st.bar_chart(sizes)
 
         name = st.selectbox("Choose a table", list(tables))
         t = tables[name]

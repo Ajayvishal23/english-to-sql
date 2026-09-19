@@ -8,6 +8,7 @@ __pycache__/
 models/
 data/uploads/
 data/sample.db
+data/benchmark/
 logs/
 
 # Run logs
@@ -15,6 +16,11 @@ setup_log.txt
 install_log.txt
 app_log.txt
 model_check.txt
+benchmark_log.txt
+benchmark_results.json
+
+# Leftover scratch copy (safe to delete)
+scripts/benchmark_new.py
 
 # Owner-only helper
 publish_to_github.bat

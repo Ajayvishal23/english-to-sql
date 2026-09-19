@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 from llm.generator import LLMError, SQLGenerator
 from sql.executor import ExecutionResult, QueryExecutor
+from sql.schema_guard import check_sql, parse_schema_text
 from sql.validator import SQLValidator, sanitize_question
 from utils.logger import get_logger
 
@@ -58,6 +59,7 @@ class PipelineResult:
     execution: ExecutionResult | None = None
     attempts: list[Attempt] = field(default_factory=list)
     error: str | None = None
+    notes: list[str] = field(default_factory=list)  # what was fixed silently
 
     @property
     def success(self) -> bool:
@@ -69,11 +71,32 @@ class Text2SQLPipeline:
 
     def __init__(self, generator: SQLGenerator, executor: QueryExecutor,
                  validator: SQLValidator | None = None,
-                 max_question_length: int = 500) -> None:
+                 max_question_length: int = 500,
+                 max_schema_retries: int = 1) -> None:
         self.generator = generator
         self.executor = executor
         self.validator = validator or executor.validator
         self.max_question_length = max_question_length
+        # How many times the model may be asked to fix a query that does not
+        # match the schema (checked before it is ever executed).
+        self.max_schema_retries = max_schema_retries
+
+    def _schema_repair(self, sql: str, schema: str) -> tuple[str, list[str], str]:
+        """Fix wrong aliases against the real schema; report what is left.
+
+        Returns ``(sql, notes, error_for_the_model)``.
+        """
+        tables = parse_schema_text(schema)
+        if not tables:
+            return sql, [], ""
+        check = check_sql(sql, tables)
+        if check.ok:
+            return sql, [], ""
+        if check.fixed_sql:
+            logger.info("Repaired query against the schema: %s", check.fixed_sql)
+            return check.fixed_sql, [
+                "Fixed automatically: " + "; ".join(check.problems)], ""
+        return sql, [], "; ".join(check.problems) + "." + check.hint
 
     def generate(self, question: str, schema: str) -> PipelineResult:
         """Step 1: English -> SQL (not executed, so the user can review it)."""
@@ -85,6 +108,16 @@ class Text2SQLPipeline:
             sql = self.generator.generate_sql(clean_q, schema)
         except LLMError as exc:
             return PipelineResult(clean_q, "", error=str(exc))
+
+        sql, notes, schema_error = self._schema_repair(sql, schema)
+        if schema_error and self.max_schema_retries:
+            # The query does not match the database: give the model the facts.
+            try:
+                sql = self.generator.fix_sql(clean_q, schema, sql, schema_error)
+            except LLMError as exc:
+                return PipelineResult(clean_q, sql, error=str(exc), notes=notes)
+            sql, more_notes, schema_error = self._schema_repair(sql, schema)
+            notes += more_notes
 
         check = self.validator.validate(sql)
         if not check.is_valid:
@@ -100,16 +133,20 @@ class Text2SQLPipeline:
                 return PipelineResult(clean_q, sql, error=str(exc))
             if not check.is_valid:
                 return PipelineResult(
-                    clean_q, sql,
+                    clean_q, sql, notes=notes,
                     error="Generated query is not allowed: " + " ".join(check.errors),
                 )
-        return PipelineResult(clean_q, check.sql)
+        if schema_error:
+            notes.append("The query may still not match the database: "
+                         + schema_error.strip())
+        return PipelineResult(clean_q, check.sql, notes=notes)
 
     def run(self, question: str, sql: str, schema: str,
             max_retries: int = 2) -> PipelineResult:
         """Step 2: execute SQL, asking the LLM to fix it on failure."""
         result = PipelineResult(question, sql)
-        current = sql
+        current, notes, _ = self._schema_repair(sql, schema)
+        result.notes += notes
         for attempt_no in range(max_retries + 1):
             execution = self.executor.execute(current)
             result.attempts.append(Attempt(current, execution.error))

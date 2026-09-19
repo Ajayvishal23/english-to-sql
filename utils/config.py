@@ -54,6 +54,9 @@ class Settings:
     sample_rows_in_prompt: int = field(
         default_factory=lambda: _env_int("T2S_SAMPLE_ROWS", 2)
     )
+    max_tables_in_prompt: int = field(
+        default_factory=lambda: _env_int("T2S_MAX_TABLES", 12)
+    )
     max_question_length: int = 500
 
     # --- Paths ---

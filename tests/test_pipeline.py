@@ -111,3 +111,40 @@ def test_error_hint_points_at_the_right_table(connector) -> None:
     assert "order_items" in hint
     assert "no table 'sales'" in error_hint("no such table: sales", schema)
     assert error_hint("syntax error", schema) == ""
+
+
+def test_relevant_tables_for_big_schemas(connector) -> None:
+    reader = SchemaReader(connector)
+    picked = reader.relevant_tables("Which products sell the most?", max_tables=3)
+    assert "products" in picked
+    assert len(picked) <= 7  # 3 matches + linked tables
+    # With room for everything, nothing is dropped.
+    assert set(reader.relevant_tables("anything", max_tables=50)) == set(
+        reader.get_tables())
+
+
+def test_prompt_context_limits_tables(connector) -> None:
+    reader = SchemaReader(connector)
+    context = reader.to_prompt_context(0, question="list the products",
+                                       max_tables=2)
+    assert "CREATE TABLE products" in context
+    assert "tables shown" in context
+
+
+def test_pipeline_repairs_wrong_alias_without_running_it(
+        connector, fake_llm_factory) -> None:
+    """A wrong alias is fixed from the schema, with no extra model call."""
+    bad = ("```sql\nSELECT p.name, SUM(p.unit_price * o.quantity) AS revenue "
+           "FROM products p JOIN order_items i ON i.product_id = p.product_id "
+           "JOIN orders o ON o.order_id = i.order_id GROUP BY p.name "
+           "ORDER BY revenue DESC LIMIT 5\n```")
+    llm = fake_llm_factory([bad])
+    pipe = Text2SQLPipeline(SQLGenerator(llm), QueryExecutor(connector))
+    schema = SchemaReader(connector).to_prompt_context(0)
+    result = pipe.generate("top products by revenue", schema)
+    assert result.error is None
+    assert "i.quantity" in result.sql          # repaired
+    assert len(llm.calls) == 1                 # no second model call
+    assert any("Fixed automatically" in n for n in result.notes)
+    run = pipe.run(result.question, result.sql, schema, max_retries=0)
+    assert run.success and run.execution.row_count == 5

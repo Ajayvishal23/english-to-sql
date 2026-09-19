@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -62,7 +63,7 @@ class SchemaReader:
         self.connector = connector
         self._tables: dict[str, TableInfo] | None = None
         self._metadata = MetaData()
-        self._context_cache: dict[int, str] = {}
+        self._context_cache: dict[tuple[int, tuple[str, ...]], str] = {}
 
     # ------------------------------------------------------------------ #
     # Discovery
@@ -151,16 +152,55 @@ class SchemaReader:
     # ------------------------------------------------------------------ #
     # Prompt context
     # ------------------------------------------------------------------ #
-    def to_prompt_context(self, sample_rows: int = 3) -> str:
+    def relevant_tables(self, question: str, max_tables: int = 12) -> list[str]:
+        """Tables worth showing the model for this question.
+
+        Big databases do not fit in a small model's context, so tables are
+        scored by how well their name and columns match the question, and the
+        tables they are linked to by foreign keys are pulled in as well.
+        """
+        tables = self.get_tables()
+        names = list(tables)
+        if len(names) <= max_tables or not question:
+            return names
+        asked = _words(question)
+        scored: list[tuple[float, str]] = []
+        for name, info in tables.items():
+            score = 3.0 * len(asked & _words(name))
+            score += sum(0.7 for c in info.columns if asked & _words(c.name))
+            scored.append((score, name))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        chosen = [name for score, name in scored if score > 0][:max_tables]
+        if not chosen:  # nothing matched: fall back to the biggest tables
+            by_rows = sorted(tables.values(), key=lambda t: -(t.row_count or 0))
+            return [t.name for t in by_rows[:max_tables]]
+        # Pull in directly linked tables so JOINs stay possible.
+        linked: list[str] = []
+        for name in chosen:
+            for fk in tables[name].foreign_keys:
+                if fk.referred_table in tables:
+                    linked.append(fk.referred_table)
+            for other, info in tables.items():
+                if any(fk.referred_table == name for fk in info.foreign_keys):
+                    linked.append(other)
+        for name in linked:
+            if name not in chosen and len(chosen) < max_tables + 4:
+                chosen.append(name)
+        return chosen
+
+    def to_prompt_context(self, sample_rows: int = 3, question: str = "",
+                          max_tables: int = 12) -> str:
         """Render the schema as compact CREATE TABLE statements + samples.
 
         Sample rows help the model learn value formats (e.g. 'Germany'
         vs 'DE'), which dramatically improves WHERE-clause accuracy.
         """
-        if sample_rows in self._context_cache:
-            return self._context_cache[sample_rows]
+        wanted = self.relevant_tables(question, max_tables)
+        key = (sample_rows, tuple(wanted))
+        if key in self._context_cache:
+            return self._context_cache[key]
         blocks: list[str] = []
-        for t in self.get_tables().values():
+        for t in (self.get_tables()[name] for name in wanted):
             lines = []
             for c in t.columns:
                 flags = " PRIMARY KEY" if c.primary_key else ""
@@ -187,8 +227,40 @@ class SchemaReader:
                     logger.debug("No samples for %s: %s", t.name, exc)
             blocks.append(block)
         context = "\n\n".join(blocks)
-        self._context_cache[sample_rows] = context
+        total = len(self.get_tables())
+        if len(wanted) < total:
+            context += (f"\n\n/* {len(wanted)} of {total} tables shown: the ones "
+                        f"that match the question. */")
+        self._context_cache[key] = context
         return context
+
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_STOP = {
+    "show", "list", "give", "find", "get", "all", "the", "a", "an", "of", "in",
+    "for", "by", "with", "and", "or", "me", "my", "how", "many", "much", "what",
+    "which", "who", "when", "where", "top", "most", "least", "per", "each",
+    "from", "that", "have", "has", "are", "is", "was", "were", "do", "does",
+    "count", "total", "sum", "average", "avg", "number", "last", "first",
+}
+
+
+def _words(text: str) -> set[str]:
+    """Lower-case word stems of a question or identifier (plural-insensitive)."""
+    out = set()
+    for word in _WORD_RE.findall((text or "").lower().replace("_", " ")):
+        if word in _STOP or len(word) < 3:
+            continue
+        out.add(word)
+        if word.endswith("ies"):
+            out.add(word[:-3] + "y")
+        elif word.endswith("es"):
+            out.add(word[:-2])
+        if word.endswith("s"):
+            out.add(word[:-1])
+        else:
+            out.add(word + "s")
+    return out
 
 
 def _truncate(value: object, limit: int = 40) -> object:

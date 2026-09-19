@@ -1,4 +1,4 @@
-# English -> SQL dependencies (pip install -r requirements.txt)
+# Dependencies for English -> SQL (pip install -r requirements.txt)
 # App
 streamlit>=1.36,<2.0
 SQLAlchemy>=2.0,<3.0

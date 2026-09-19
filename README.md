@@ -45,6 +45,54 @@ A sample shop database is created automatically so you can try it right away.
 To use your own data, open **🗄️ Database** in the sidebar and upload a SQLite file,
 enter its path, or paste a connection URL.
 
+## 📊 How accurate is it?
+
+The repo ships a benchmark: 36 plain-English questions across **5 databases**
+(a retail shop, a Chinook-style music store, an HR database, a library and a
+clinic — different naming styles, join depths, dates and NULLs). Every
+question has a reference query written by hand; scoring compares the **result
+rows**, so any correct formulation counts.
+
+```bash
+python scripts/benchmark.py            # writes benchmark_results.md
+run_benchmark.bat                      # Windows
+```
+
+Measured on a laptop (Intel i5-1035G1, 8 GB RAM, CPU only) with the default
+**Qwen2.5-Coder 0.5B**:
+
+| Database | Accuracy |
+|---|---|
+| Clinic | 7/7 — 100% |
+| Retail shop | 6/8 — 75% |
+| Music store | 5/7 — 71% |
+| HR | 4/7 — 57% |
+| Library | 4/7 — 57% |
+| **Overall** | **26/36 — 72%** |
+
+Before the schema guard and prompt rules described below, the same suite
+scored 64%. Accuracy depends heavily on the model: the 1.5B model does better
+if you have the RAM, and a larger model behind LangChain (Ollama, an API) does
+better still.
+
+**What still goes wrong** (see `benchmark_results.md` for the full list): a
+small model sometimes invents a table, joins one it does not need (which
+duplicates rows), or filters a date with `=` instead of a range. That is why
+the SQL is always shown to you before it runs, and why it stays editable.
+
+### How wrong queries are caught
+
+1. **Schema guard** (`sql/schema_guard.py`) — before a query ever runs, every
+   table and `alias.column` is checked against the real schema. Wrong aliases
+   (`o.quantity` when quantity is in `order_items`), undefined aliases
+   (`i.quantity` when the table was aliased `oi`), duplicate aliases and
+   near-miss names (`specialty` → `speciality`) are repaired automatically or
+   explained to the model.
+2. **Safety validator** — only a single read-only `SELECT` survives.
+3. **Self-correction** — if the database still rejects the query, the error
+   plus a hint ("quantity belongs to order_items") goes back to the model.
+
+
 ---
 
 ## Features
@@ -61,7 +109,9 @@ enter its path, or paste a connection URL.
 | Explanation | Plain-English bullet points for any query |
 | Results | Interactive table, row/time metrics, CSV and JSON download, row cap + timeout |
 | Explorer | Column list, data preview, relationship graph |
-| Charts | Automatic bar/line chart when the result has a label and a number column |
+| Charts | Automatic bar/line chart, switchable to area/scatter with your own x and y |
+| Big databases | Only the tables that match your question (plus linked ones) are sent to the model |
+| Schema guard | Wrong, undefined and misspelled table/column references are repaired before the query runs |
 | History | The last 50 queries, one click to load back into the editor |
 
 ---
